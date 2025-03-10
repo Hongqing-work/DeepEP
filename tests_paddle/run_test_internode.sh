@@ -1,6 +1,6 @@
 #!/bin/bash
 
-bash kill_process.sh
+#bash kill_process.sh
 
 WORK_ROOT=/root/paddlejob/workspace/env_run/liuyiqun
 export PYTHONPATH=${WORK_ROOT}/env/virtualenvs_cuda12.3/paddle_py310_yiqun
@@ -17,10 +17,12 @@ unset DISTRIBUTED_TRAINER_ENDPOINTS
 unset FLAGS_START_PORT
 unset PADDLE_ELASTIC_TIMEOUT
 
+export WORLD_SIZE=2
+
 master_addr=10.95.230.152
 master_port=58978
 #nnodes=$PADDLE_TRAINERS_NUM
-nnodes=2
+nnodes=${WORLD_SIZE}
 rank=$PADDLE_TRAINER_ID
 
 if [ ${PADDLE_TRAINER_ID} -ge ${nnodes} ]; then

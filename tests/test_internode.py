@@ -30,6 +30,13 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+
+    if dump_input_output:
+        utils.dump(x, 'x', local_rank)
+        utils.dump(x_pure_rand, 'x_pure_rand', local_rank)
+        utils.dump(x_e4m3, 'x_e4m3', local_rank)
+        utils.dump(topk_idx, 'topk_idx', local_rank)
+
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rank_idx, num_ranks)
@@ -68,9 +75,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
 
-    if dump_input_output:
-        utils.dump(topk_idx, 'topk_idx', local_rank)
-
     ref_num_tokens_per_rank, ref_num_tokens_per_rdma_rank, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
 
@@ -108,7 +112,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     for previous_mode in (False, True):
         for async_mode in (False, True):
             for current_x in (x_pure_rand, x, x_e4m3):
-            #for current_x in (x_pure_rand, x_e4m3):
                 for with_topk in (False, True):
                     dump_prefix = f'{"FP8" if isinstance(current_x, tuple) else "BF16"}_{"with" if with_topk else "without"}_top-k_async_{async_mode}_previous_{previous_mode}_'
                     if local_rank == 0:
@@ -121,7 +124,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         dispatch_args.update({'previous_event': buffer.capture()})
 
                     if dump_input_output:
-                        utils.dump(current_x, f'{dump_prefix}current_x', local_rank)
                         utils.dump(num_tokens_per_rank, f'{dump_prefix}num_tokens_per_rank', local_rank)
                         utils.dump(num_tokens_per_rdma_rank, f'{dump_prefix}num_tokens_per_rdma_rank', local_rank)
                         utils.dump(is_token_in_rank, f'{dump_prefix}is_token_in_rank', local_rank)
@@ -272,10 +274,9 @@ def test_loop(local_rank: int, num_local_ranks: int):
     assert num_local_ranks == 8 and num_ranks > 8
     torch.manual_seed(rank)
 
-    dump_input_output = False
+    dump_input_output = True
     for i in (24, ):
         test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, dump_input_output)
-        dump_input_output = False
         if local_rank == 0:
             print()
 

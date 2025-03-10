@@ -41,23 +41,26 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         if dump_input:
             utils.dump(topk_idx, "topk_idx", local_rank)
     else:
+        x = utils.load("x", local_rank)
+        x_pure_rand = utils.load("x_pure_rand", local_rank)
+        x_e4m3 = utils.load("x_e4m3", local_rank, "tuple")
         topk_idx = utils.load("topk_idx", local_rank)
 
+    rank_idx = topk_idx // (num_experts // num_ranks)
+    rank_idx.masked_fill_(topk_idx == -1, -1)
+    inplace_unique(rank_idx, num_ranks)
+
+    rdma_rank_idx = rank_idx // num_local_ranks
+    rdma_rank_idx.masked_fill_(rank_idx == -1, -1)
+    inplace_unique(rdma_rank_idx, num_nodes)
+
+    # RDMA dispatch counts
+    rdma_idx = topk_idx // (num_experts // num_nodes)
+    rdma_idx.masked_fill_(topk_idx == -1, -1)
+    inplace_unique(rdma_idx, num_nodes)
+    num_rdma_token_sent = paddle.not_equal(rdma_idx, paddle.full_like(rdma_idx, -1)).sum().item()
+
     if use_random_input:
-        rank_idx = topk_idx // (num_experts // num_ranks)
-        rank_idx.masked_fill_(topk_idx == -1, -1)
-        inplace_unique(rank_idx, num_ranks)
-
-        rdma_rank_idx = rank_idx // num_local_ranks
-        rdma_rank_idx.masked_fill_(rank_idx == -1, -1)
-        inplace_unique(rdma_rank_idx, num_nodes)
-
-        # RDMA dispatch counts
-        rdma_idx = topk_idx // (num_experts // num_nodes)
-        rdma_idx.masked_fill_(topk_idx == -1, -1)
-        inplace_unique(rdma_idx, num_nodes)
-        num_rdma_token_sent = paddle.not_equal(rdma_idx, paddle.full_like(rdma_idx, -1)).sum().item()
-
         # Expert meta
         num_tokens_per_expert = paddle.zeros(shape=[num_experts, ], dtype=paddle.int32)
         for i in range(num_experts):
@@ -96,10 +99,11 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         utils.dump(ref_num_tokens_per_expert, "ref_num_tokens_per_expert", local_rank)
         utils.dump(ref_is_token_in_rank, "ref_is_token_in_rank", local_rank)    
 
-    assert paddle.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
-    assert paddle.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
-    assert paddle.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
-    assert paddle.allclose(ref_is_token_in_rank, is_token_in_rank)
+    if use_random_input:
+        assert paddle.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
+        assert paddle.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
+        assert paddle.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
+        assert paddle.allclose(ref_is_token_in_rank, is_token_in_rank)
 
     t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
     if local_rank == 0:
@@ -126,11 +130,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
     for previous_mode in (False, True):
         for async_mode in (False, True):
-            if use_random_input:
-                current_x_list = (x_pure_rand, x, x_e4m3)
-            else:
-                current_x_list = ("hack", ("hack", "hack"))
-            for current_x in current_x_list:
+            for current_x in (x_pure_rand, x, x_e4m3):
                 for with_topk in (False, True):
                     dtype_str = "FP8" if isinstance(current_x, tuple) else "BF16"
                     if local_rank == 0:
@@ -139,7 +139,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                     dump_prefix = f'{dtype_str}_{"with" if with_topk else "without"}_top-k_async_{async_mode}_previous_{previous_mode}_'
 
                     if not use_random_input:
-                        current_x = utils.load(f"{dump_prefix}current_x", local_rank, "tuple" if isinstance(current_x, tuple) else "tensor")
                         num_tokens_per_rank = utils.load(f"{dump_prefix}num_tokens_per_rank", local_rank)
                         num_tokens_per_rdma_rank = utils.load(f"{dump_prefix}num_tokens_per_rdma_rank", local_rank)
                         is_token_in_rank = utils.load(f"{dump_prefix}is_token_in_rank", local_rank)
@@ -195,21 +194,24 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                     if dump_output:
                         utils.dump(recv_gbl_rank_prefix_sum, f"{dump_prefix}recv_gbl_rank_prefix_sum", local_rank)
 
-                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.shape[0], f'{gbl_num_tokens_per_rank[rank].item()} != {recv_x.shape[0]}'
-                    assert gbl_num_tokens_per_expert.view([num_ranks, -1])[rank].tolist() == recv_num_tokens_per_expert_list
-                    if current_x is not x_pure_rand:
-                        pass
-                        # check_data(recv_x, recv_gbl_rank_prefix_sum)
+                    if use_random_input:
+                        assert gbl_num_tokens_per_rank[rank].item() == recv_x.shape[0], f'{gbl_num_tokens_per_rank[rank].item()} != {recv_x.shape[0]}'
+                        assert gbl_num_tokens_per_expert.view([num_ranks, -1])[rank].tolist() == recv_num_tokens_per_expert_list
+
+                        if current_x is not x_pure_rand:
+                            pass
+                            # check_data(recv_x, recv_gbl_rank_prefix_sum)
                     if with_topk:
                         # Check `topk_idx`
                         assert (recv_topk_idx.equal(-1) | ((recv_topk_idx >= 0) & (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
                         for i, count in enumerate(recv_num_tokens_per_expert_list):
                             assert recv_topk_idx.equal(i).sum().item() == count
 
-                        # Check `topk_weights`
-                        if current_x is not x_pure_rand:
-                            recv_topk_weights[recv_topk_idx.equal(-1)] = recv_topk_weights.amax(axis=1, keepdim=True).expand_as(recv_topk_weights)[recv_topk_idx.equal(-1)]
-                            # check_data(recv_topk_weights, recv_gbl_rank_prefix_sum)
+                        if use_random_input:
+                            # Check `topk_weights`
+                            if current_x is not x_pure_rand:
+                                recv_topk_weights[recv_topk_idx.equal(-1)] = recv_topk_weights.amax(axis=1, keepdim=True).expand_as(recv_topk_weights)[recv_topk_idx.equal(-1)]
+                                # check_data(recv_topk_weights, recv_gbl_rank_prefix_sum)
 
                     # Test cached dispatch (must without top-k staffs)
                     # NOTES: handle must be refreshed
@@ -225,9 +227,11 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                             utils.dump(recv_x, f"{dump_prefix}recv_x_wo_topk", local_rank)
 
                         recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
-                        if current_x is not x_pure_rand:
-                            pass
-                            # check_data(recv_x, recv_gbl_rank_prefix_sum)
+
+                        if use_random_input:
+                            if current_x is not x_pure_rand:
+                                pass
+                                # check_data(recv_x, recv_gbl_rank_prefix_sum)
 
                     # Test combine
                     if not use_random_input:
@@ -256,8 +260,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         utils.dump(combined_topk_weights, f"{dump_prefix}combined_topk_weights", local_rank)
 
                     # check_x = combined_x.cast(paddle.float32) / is_token_in_rank.sum(axis=1).unsqueeze(1)
-                    ref_x = x_pure_rand if current_x is x_pure_rand else x
-                    # assert calc_diff(check_x, ref_x) < 5e-6
+                    if use_random_input:
+                        ref_x = x_pure_rand if current_x is x_pure_rand else x
+                        # assert calc_diff(check_x, ref_x) < 5e-6
                     if with_topk:
                         pass
                         # check_topk_weights = combined_topk_weights if (current_x is x_pure_rand) else (combined_topk_weights / is_token_in_rank.sum(dim=1).unsqueeze(1))
@@ -373,7 +378,8 @@ def test_loop():
 if __name__ == '__main__':
     #num_processes = 8
     #torch.multiprocessing.spawn(test_loop, args=(num_processes, ), nprocs=num_processes)
-    mp_degree = 16
+    world_size = int(os.getenv('WORLD_SIZE', 1))
+    mp_degree = world_size * 8
     strategy = fleet.DistributedStrategy()
     strategy.hybrid_configs = {
         "mp_degree": mp_degree,
