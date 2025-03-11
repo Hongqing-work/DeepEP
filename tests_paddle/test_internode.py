@@ -44,7 +44,10 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         x = utils.load("x", local_rank)
         x_pure_rand = utils.load("x_pure_rand", local_rank)
         x_e4m3 = utils.load("x_e4m3", local_rank, "tuple")
+
         topk_idx = utils.load("topk_idx", local_rank)
+        topk_weights = utils.load("topk_weights", local_rank)
+        topk_weights_pure_rand = utils.load("topk_weights_pure_rand", local_rank)
 
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx.masked_fill_(topk_idx == -1, -1)
@@ -154,11 +157,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         'async_finish': async_mode
                     }
                     if with_topk:
-                        if not use_random_input:
-                            if not isinstance(current_x, tuple):
-                                topk_weights_pure_rand = utils.load(f"{dump_prefix}topk_weights", local_rank)
-                            else:
-                                topk_weights = utils.load(f"{dump_prefix}topk_weights", local_rank)
                         dispatch_args.update({
                             'topk_idx': topk_idx,
                             'topk_weights': topk_weights_pure_rand if not isinstance(current_x, tuple) else topk_weights
@@ -172,10 +170,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         utils.dump(num_tokens_per_rank, f"{dump_prefix}num_tokens_per_rank", local_rank)
                         utils.dump(is_token_in_rank, f"{dump_prefix}is_token_in_rank", local_rank)
                         utils.dump(num_tokens_per_expert, f"{dump_prefix}num_tokens_per_expert", local_rank)
-
-                        if with_topk:
-                            utils.dump(topk_idx, f"{dump_prefix}topk_idx", local_rank)
-                            utils.dump(topk_weights_pure_rand if current_x is x_pure_rand else topk_weights, f"{dump_prefix}topk_weights", local_rank)
 
                     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = buffer.dispatch(**dispatch_args)
                     event.current_stream_wait() if async_mode else ()

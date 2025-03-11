@@ -10,6 +10,7 @@ from utils import init_dist, bench, calc_diff, create_grouped_scores, inplace_un
 
 # Test compatibility with low latency functions
 import test_low_latency
+#import paperf
 
 
 def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup, dump_input_output):
@@ -23,10 +24,12 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     x_e4m3 = per_token_cast_to_fp8(x)
+
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
     masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
+
     topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
@@ -35,7 +38,10 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         utils.dump(x, 'x', local_rank)
         utils.dump(x_pure_rand, 'x_pure_rand', local_rank)
         utils.dump(x_e4m3, 'x_e4m3', local_rank)
+
         utils.dump(topk_idx, 'topk_idx', local_rank)
+        utils.dump(topk_weights, 'topk_weights', local_rank)
+        utils.dump(topk_weights_pure_rand, 'topk_weights_pure_rand', local_rank)
 
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx.masked_fill_(topk_idx == -1, -1)
@@ -128,7 +134,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         utils.dump(num_tokens_per_rdma_rank, f'{dump_prefix}num_tokens_per_rdma_rank', local_rank)
                         utils.dump(is_token_in_rank, f'{dump_prefix}is_token_in_rank', local_rank)
                         utils.dump(num_tokens_per_expert, f'{dump_prefix}num_tokens_per_expert', local_rank)
-                        utils.dump(topk_weights_pure_rand if current_x is x_pure_rand else topk_weights, f'{dump_prefix}topk_weights', local_rank)
 
                     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = buffer.dispatch(**dispatch_args)
                     event.current_stream_wait() if async_mode else ()
@@ -237,11 +242,13 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
             all_best_fp8_results_list = [torch.zeros_like(best_dispatch_results) for _ in range(torch.distributed.get_world_size())]
             dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
             best_dispatch_results = all_best_fp8_results_list[0].tolist()
+
     dispatch_config = deep_ep.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2], rdma_buffer_size)
 
     dispatch_args = {'x': x, 'num_tokens_per_rank': num_tokens_per_rank, 'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
                      'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
                      'config': dispatch_config if dispatch_config is not None else config}
+    #profile_torch.switch_profile(profile_dispatch, 10, 11, enable_aten_event=True)
     recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
 
     # Tune combine performance
@@ -274,7 +281,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
     assert num_local_ranks == 8 and num_ranks > 8
     torch.manual_seed(rank)
 
-    dump_input_output = True
+    dump_input_output = False
     for i in (24, ):
         test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, dump_input_output)
         if local_rank == 0:
