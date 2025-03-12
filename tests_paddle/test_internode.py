@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import paddle
 import paddle.distributed as dist
@@ -14,6 +15,7 @@ from utils import bench, create_grouped_scores, inplace_unique, per_token_cast_t
 
 # Test compatibility with low latency functions
 #import test_low_latency
+from paperf import profile_paddle
 
 
 def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: Group, use_random_input: bool, dump_input: bool, dump_output: bool, tune_performance: bool):
@@ -62,6 +64,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     rdma_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rdma_idx, num_nodes)
     num_rdma_token_sent = paddle.not_equal(rdma_idx, paddle.full_like(rdma_idx, -1)).sum().item()
+    print(f"-- [local_rank={local_rank}, rank={rank}] num_rdma_token_sent: {num_rdma_token_sent}")
 
     if use_random_input:
         # Expert meta
@@ -88,6 +91,13 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         is_token_in_rank = token_idx_in_rank >= 0
         gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
         dist.all_reduce(gbl_num_tokens_per_rank, group=group)
+    else:
+        num_tokens_per_rank = utils.load('num_tokens_per_rank', local_rank)
+        num_tokens_per_rdma_rank = utils.load('num_tokens_per_rdma_rank', local_rank)
+        is_token_in_rank = utils.load('is_token_in_rank', local_rank)
+        num_tokens_per_expert = utils.load('num_tokens_per_expert', local_rank)
+        gbl_num_tokens_per_rank = utils.load('gbl_num_tokens_per_rank', local_rank)
+        gbl_num_tokens_per_expert = utils.load('gbl_num_tokens_per_expert', local_rank)
 
     ############################################################################################################
     # get_dispatch_layout
@@ -102,11 +112,10 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         utils.dump(ref_num_tokens_per_expert, "ref_num_tokens_per_expert", local_rank)
         utils.dump(ref_is_token_in_rank, "ref_is_token_in_rank", local_rank)    
 
-    if use_random_input:
-        assert paddle.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
-        assert paddle.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
-        assert paddle.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
-        assert paddle.allclose(ref_is_token_in_rank, is_token_in_rank)
+    assert paddle.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
+    assert paddle.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
+    assert paddle.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
+    assert paddle.allclose(ref_is_token_in_rank, is_token_in_rank)
 
     t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
     if local_rank == 0:
@@ -141,12 +150,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
                     dump_prefix = f'{dtype_str}_{"with" if with_topk else "without"}_top-k_async_{async_mode}_previous_{previous_mode}_'
 
-                    if not use_random_input:
-                        num_tokens_per_rank = utils.load(f"{dump_prefix}num_tokens_per_rank", local_rank)
-                        num_tokens_per_rdma_rank = utils.load(f"{dump_prefix}num_tokens_per_rdma_rank", local_rank)
-                        is_token_in_rank = utils.load(f"{dump_prefix}is_token_in_rank", local_rank)
-                        num_tokens_per_expert = utils.load(f"{dump_prefix}num_tokens_per_expert", local_rank)
-
                     dispatch_args = {
                         'x': current_x,
                         'num_tokens_per_rank': num_tokens_per_rank,
@@ -165,12 +168,6 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                     if previous_mode:
                         dispatch_args.update({'previous_event': buffer.capture()})
 
-                    if dump_input:
-                        utils.dump(current_x, f"{dump_prefix}current_x", local_rank)
-                        utils.dump(num_tokens_per_rank, f"{dump_prefix}num_tokens_per_rank", local_rank)
-                        utils.dump(is_token_in_rank, f"{dump_prefix}is_token_in_rank", local_rank)
-                        utils.dump(num_tokens_per_expert, f"{dump_prefix}num_tokens_per_expert", local_rank)
-
                     recv_x, recv_topk_idx, recv_topk_weights, recv_num_tokens_per_expert_list, handle, event = buffer.dispatch(**dispatch_args)
                     event.current_stream_wait() if async_mode else ()
 
@@ -188,13 +185,11 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                     if dump_output:
                         utils.dump(recv_gbl_rank_prefix_sum, f"{dump_prefix}recv_gbl_rank_prefix_sum", local_rank)
 
-                    if use_random_input:
-                        assert gbl_num_tokens_per_rank[rank].item() == recv_x.shape[0], f'{gbl_num_tokens_per_rank[rank].item()} != {recv_x.shape[0]}'
-                        assert gbl_num_tokens_per_expert.view([num_ranks, -1])[rank].tolist() == recv_num_tokens_per_expert_list
-
-                        if current_x is not x_pure_rand:
-                            pass
-                            # check_data(recv_x, recv_gbl_rank_prefix_sum)
+                    assert gbl_num_tokens_per_rank[rank].item() == recv_x.shape[0], f'{gbl_num_tokens_per_rank[rank].item()} != {recv_x.shape[0]}'
+                    assert gbl_num_tokens_per_expert.view([num_ranks, -1])[rank].tolist() == recv_num_tokens_per_expert_list
+                    if current_x is not x_pure_rand:
+                        pass
+                        # check_data(recv_x, recv_gbl_rank_prefix_sum)
                     if with_topk:
                         # Check `topk_idx`
                         assert (recv_topk_idx.equal(-1) | ((recv_topk_idx >= 0) & (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
@@ -278,6 +273,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     if not tune_performance:
         return
 
+    def print_tensor_info(t, name):
+        print(f"-- {name}: data_ptr={t.data_ptr()}, shape={t.shape}, dtype={t.dtype}") 
+
     # Tune dispatch performance
     best_dispatch_results = None
     fp8_factor = (1 + 4 / 128) / 2
@@ -304,12 +302,33 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
             all_best_fp8_results_list = [paddle.zeros_like(best_dispatch_results) for _ in range(paddle.distributed.get_world_size(group))]
             dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
             best_dispatch_results = all_best_fp8_results_list[0].tolist()
-    dispatch_config = Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2], rdma_buffer_size)
+
+    print(f"========================================================================")
+
+    #dispatch_config = Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2], rdma_buffer_size)
+    dispatch_config = Config(24, 20, 512, 32, 128)
 
     dispatch_args = {'x': x, 'num_tokens_per_rank': num_tokens_per_rank, 'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
                      'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
                      'config': dispatch_config if dispatch_config is not None else config}
-    recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
+
+    #if local_rank == 0:
+    #    print_tensor_info(x, "x")
+    #    print_tensor_info(num_tokens_per_rank, "num_tokens_per_rank")
+    #    print_tensor_info(num_tokens_per_rdma_rank, "num_tokens_per_rdma_rank")
+    #    print_tensor_info(is_token_in_rank, "is_token_in_rank")
+    #    print_tensor_info(num_tokens_per_expert, "num_tokens_per_expert")
+    #    print(f"-- dispatch_args: {dispatch_args}")
+    #    print(f"-- dispatch_config: {best_dispatch_results[0]}, {best_dispatch_results[1]}, {nvl_buffer_size}, {best_dispatch_results[2]}, {rdma_buffer_size}")
+
+    for i in range(1):
+        profile_paddle.switch_profile(i, 5, 15)
+        recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
+
+    sys.exit(0)
+
+    #if local_rank == 0:
+    #    print_tensor_info(recv_x, "recv_x")
 
     # Tune combine performance
     best_time, best_results = 1e10, None
