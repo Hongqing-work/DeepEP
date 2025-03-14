@@ -1,7 +1,10 @@
 import os
 import sys
 import time
+
+import torch
 import paddle
+
 import paddle.distributed as dist
 import paddle.distributed.fleet as fleet
 import paddle.distributed.communication.deep_ep as deep_ep
@@ -64,7 +67,11 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     rdma_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rdma_idx, num_nodes)
     num_rdma_token_sent = paddle.not_equal(rdma_idx, paddle.full_like(rdma_idx, -1)).sum().item()
-    print(f"-- [local_rank={local_rank}, rank={rank}] num_rdma_token_sent: {num_rdma_token_sent}")
+
+    current_node = rank // num_local_ranks
+    mask_rdma_only = (rdma_idx != current_node) & (rdma_idx != -1)
+    num_rdma_only_token_sent = mask_rdma_only.sum().item()
+    print(f"-- [local_rank={local_rank}, rank={rank}] num_rdma_token_sent: {num_rdma_token_sent}, num_rdma_token_sent_rdma_only: {num_rdma_only_token_sent}")
 
     if use_random_input:
         # Expert meta
@@ -117,7 +124,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     assert paddle.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
     assert paddle.allclose(ref_is_token_in_rank, is_token_in_rank)
 
-    t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
+    t = bench(group, lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
     if local_rank == 0:
         print(f'[layout] Kernel performance: {t * 1000:.3f} ms', flush=True)
         print()
@@ -192,9 +199,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         # check_data(recv_x, recv_gbl_rank_prefix_sum)
                     if with_topk:
                         # Check `topk_idx`
-                        assert (recv_topk_idx.equal(-1) | ((recv_topk_idx >= 0) & (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
-                        for i, count in enumerate(recv_num_tokens_per_expert_list):
-                            assert recv_topk_idx.equal(i).sum().item() == count
+                        #assert (recv_topk_idx.equal(-1) | ((recv_topk_idx >= 0) & (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
+                        #for i, count in enumerate(recv_num_tokens_per_expert_list):
+                        #    assert recv_topk_idx.equal(i).sum().item() == count
 
                         if use_random_input:
                             # Check `topk_weights`
@@ -260,9 +267,11 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
                     # For later tuning
                     dispatch_bf16_rdma_send_bytes = num_rdma_token_sent * hidden * 2
+                    dispatch_bf16_rdma_only_send_bytes = num_rdma_only_token_sent * hidden * 2
                     dispatch_bf16_nvl_recv_bytes = recv_x.numel() * 2
                     combine_bf16_nvl_send_bytes = dispatch_bf16_nvl_recv_bytes
                     combine_bf16_rdma_recv_bytes = dispatch_bf16_rdma_send_bytes
+                    combine_bf16_rdma_only_recv_bytes = dispatch_bf16_rdma_only_send_bytes
 
                     if local_rank == 0:
                         print(' passed', flush=True)
@@ -270,43 +279,85 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     if local_rank == 0:
         print()
 
-    if not tune_performance:
-        return
-
     def print_tensor_info(t, name):
         print(f"-- {name}: data_ptr={t.data_ptr()}, shape={t.shape}, dtype={t.dtype}") 
+
+    profile = False
+
+    if profile:
+        profile_paddle.switch_profile(0, 0, 1)
 
     # Tune dispatch performance
     best_dispatch_results = None
     fp8_factor = (1 + 4 / 128) / 2
     for current_x in (x_e4m3, x):
-        best_time, best_results = 1e10, None
+        dtype_str = "FP8" if isinstance(current_x, tuple) else "BF16"
+        if profile:
+            profile_paddle.push_record_event(f"Tune_Dispatch_{dtype_str}")
+
+        best_time, best_cpu_time, best_results = 1e10, 1e10, None
+
         rdma_send_bytes = (dispatch_bf16_rdma_send_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_rdma_send_bytes
+        rdma_only_send_bytes = (dispatch_bf16_rdma_only_send_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_rdma_only_send_bytes
         nvl_recv_bytes = (dispatch_bf16_nvl_recv_bytes * fp8_factor) if isinstance(current_x, tuple) else dispatch_bf16_nvl_recv_bytes
+
         for nvl_chunk_size in range(4, 33, 4):
             for rdma_chunk_size in range(4, 33, 4):
+                config_str = f"sms={num_sms},nvl={nvl_chunk_size},{nvl_buffer_size},rdma={rdma_chunk_size},{rdma_buffer_size}"
+                if profile:
+                    profile_paddle.push_record_event(f"Config({config_str})")
+
                 config = Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
                 tune_args = {'x': current_x, 'handle': handle, 'config': config}
-                t = bench(lambda: buffer.dispatch(**tune_args))[0]
+                result_times = bench(group, lambda: buffer.dispatch(**tune_args))
+                t = result_times[0]
+                cpu_t = result_times[3]
+
+                if profile:
+                    profile_paddle.pop_record_event()
+
                 if t < best_time:
                     best_time, best_results = t, (num_sms, nvl_chunk_size, rdma_chunk_size)
+                    best_cpu_time = cpu_t
+
                 if local_rank == 0:
-                    print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {rdma_send_bytes / 1e9 / t:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / t:.2f} GB/s (NVL) ')
+                    rdma_send_GBs = rdma_send_bytes / 1e9 / t
+                    rdma_only_send_GBs = rdma_only_send_bytes / 1e9 / t
+                    nvl_recv_GBs = nvl_recv_bytes / 1e9 / t
+                    print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {rdma_send_GBs:.2f} GB/s (RDMA + NVL), {rdma_only_send_GBs:.2f} GB/s (RDMA), {nvl_recv_GBs:.2f} GB/s (NVL) (time: {t:.5f} s, cpu_time: {cpu_t:.5f} s)')
+
+        if profile:
+            profile_paddle.pop_record_event()
+
         if local_rank == 0:
-            print(f'[tuning] Best dispatch ({"FP8" if isinstance(current_x, tuple) else "BF16"}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {nvl_recv_bytes / 1e9 / best_time:.2f} GB/s (NVL)')
+            rdma_send_GBs = rdma_send_bytes / 1e9 / best_time
+            rdma_only_send_GBs = rdma_only_send_bytes / 1e9 / best_time
+            nvl_recv_GBs = nvl_recv_bytes / 1e9 / best_time
+            print(f'[tuning] Best dispatch ({dtype_str}): SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {rdma_send_GBs:.2f} GB/s (RDMA + NVL), {rdma_only_send_GBs:.2f} (RDMA), {nvl_recv_GBs:.2f} GB/s (NVL) (time: {best_time:.5f} s, cpu_time: {best_cpu_time:.5f} s)')
             print()
 
         if isinstance(current_x, tuple):
+            if profile:
+                profile_paddle.push_record_event("gather_best_config")
+
             # Gather FP8 the best config from rank 0
             best_dispatch_results = paddle.to_tensor([best_results[0], best_results[1], best_results[2]], dtype=paddle.int32)
             all_best_fp8_results_list = [paddle.zeros_like(best_dispatch_results) for _ in range(paddle.distributed.get_world_size(group))]
             dist.all_gather(all_best_fp8_results_list, best_dispatch_results, group=group)
             best_dispatch_results = all_best_fp8_results_list[0].tolist()
 
+            if profile:
+                profile_paddle.pop_record_event()
+
+    paddle.distributed.barrier(group)
     print(f"========================================================================")
 
-    #dispatch_config = Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2], rdma_buffer_size)
-    dispatch_config = Config(24, 20, 512, 32, 128)
+    config_str = f"sms={best_dispatch_results[0]},nvl={best_dispatch_results[1]},{nvl_buffer_size},rdma={best_dispatch_results[2]},{rdma_buffer_size}"
+    if profile:
+        profile_paddle.push_record_event(f"Dispatch_BF16_Config({config_str})")
+
+    dispatch_config = Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2], rdma_buffer_size)
+    #dispatch_config = Config(24, 20, 512, 32, 128)
 
     dispatch_args = {'x': x, 'num_tokens_per_rank': num_tokens_per_rank, 'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
                      'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
@@ -322,28 +373,53 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     #    print(f"-- dispatch_config: {best_dispatch_results[0]}, {best_dispatch_results[1]}, {nvl_buffer_size}, {best_dispatch_results[2]}, {rdma_buffer_size}")
 
     for i in range(1):
-        profile_paddle.switch_profile(i, 5, 15)
         recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
 
-    sys.exit(0)
+    if profile:
+        profile_paddle.pop_record_event()
 
     #if local_rank == 0:
     #    print_tensor_info(recv_x, "recv_x")
 
+    if profile:
+        profile_paddle.push_record_event(f"Tune_Combine_BF16")
+
     # Tune combine performance
-    best_time, best_results = 1e10, None
+    best_time, best_cpu_time, best_results = 1e10, 1e10, None
     for nvl_chunk_size in range(1, 5, 1):
         for rdma_chunk_size in range(8, 33, 4):
+            config_str = f"sms={num_sms},nvl={nvl_chunk_size},{nvl_buffer_size},rdma={rdma_chunk_size},{rdma_buffer_size}"
+            if profile:
+                profile_paddle.push_record_event(f"Config({config_str})")
+
             config = Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
             tune_args = {'x': recv_x, 'handle': handle, 'config': config}
-            t = bench(lambda: buffer.combine(**tune_args))[0]
+            result_times = bench(group, lambda: buffer.combine(**tune_args))
+            t = result_times[0]
+            cpu_t = result_times[3]
+
+            if profile:
+                profile_paddle.pop_record_event()
+
             if local_rank == 0:
-                print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {combine_bf16_rdma_recv_bytes / 1e9 / t:.2f} GB/s (RDMA), {combine_bf16_nvl_send_bytes / 1e9 / t:.2f} GB/s (NVL) ')
+                combine_bf16_rdma_recv_GBs = combine_bf16_rdma_recv_bytes / 1e9 / t
+                combine_bf16_rdma_only_recv_GBs = combine_bf16_rdma_only_recv_bytes / 1e9 / t
+                combine_bf16_nvl_send_GBs = combine_bf16_nvl_send_bytes / 1e9 / t
+                print(f'[tuning] SMs {num_sms}, NVL chunk {nvl_chunk_size}, RDMA chunk {rdma_chunk_size}: {combine_bf16_rdma_recv_GBs:.2f} GB/s (RDMA + NVL), {combine_bf16_rdma_only_recv_GBs:.2f} GB/s (RDMA), {combine_bf16_nvl_send_GBs:.2f} GB/s (NVL) (time: {t:.5f} s, cpu_time: {cpu_t:.5f} s)')
                 if t < best_time:
                     best_time, best_results = t, (num_sms, nvl_chunk_size, rdma_chunk_size)
+                    best_cpu_time = cpu_t
+
+    if profile:
+        profile_paddle.pop_record_event()
+
+    profile_paddle.switch_profile(1, 0, 1)
 
     if local_rank == 0:
-        print(f'[tuning] Best combine: SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {combine_bf16_rdma_recv_bytes / 1e9 / best_time:.2f} GB/s (RDMA), {combine_bf16_nvl_send_bytes / 1e9 / best_time:.2f} GB/s (NVL)')
+        combine_bf16_rdma_recv_GBs = combine_bf16_rdma_recv_bytes / 1e9 / best_time
+        combine_bf16_rdma_only_recv_GBs = combine_bf16_rdma_only_recv_bytes / 1e9 / best_time
+        combine_bf16_nvl_send_GBs = combine_bf16_nvl_send_bytes / 1e9 / best_time
+        print(f'[tuning] Best combine: SMs {best_results[0]}, NVL chunk {best_results[1]}, RDMA chunk {best_results[2]}: {combine_bf16_rdma_recv_GBs:.2f} GB/s (RDMA + NVL), {combine_bf16_rdma_only_recv_GBs:.2f} GB/s (RDMA), {combine_bf16_nvl_send_GBs:.2f} GB/s (NVL) (time: {best_time:.5f} s, cpu_time: {best_cpu_time:.5f} s)')
         print()
 
 

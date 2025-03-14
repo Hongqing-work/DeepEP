@@ -1,7 +1,7 @@
 #!/bin/bash
 
 WORK_ROOT=/root/paddlejob/workspace/env_run/liuyiqun
-export PYTHONPATH=${WORK_ROOT}/env/virtualenvs_cuda12.3/torch_py310_yiqun
+export PYTHONPATH=${WORK_ROOT}/env/virtualenvs_cuda12.8/torch_py310_yiqun
 export PATH=${PYTHONPATH}/bin:${PATH}
 
 export PYTHONPATH=${WORK_ROOT}/PaPerf:$PYTHONPATH
@@ -9,7 +9,7 @@ export PYTHONPATH=${WORK_ROOT}/PaPerf:$PYTHONPATH
 #export NVSHMEM_DIR=$ROOT_DIR/third-party/nvshmem
 #export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH"
 
-export MASTER_ADDR=10.95.230.152
+export MASTER_ADDR=10.54.95.204
 export MASTER_PORT=8367
 export WORLD_SIZE=2
 #export RANK=$(($PADDLE_TRAINER_ID - 2))
@@ -49,9 +49,13 @@ export NVSHMEM_BOOTSTRAP=UID
 export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME==xgbe0
 #export NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY=AF_INET
 
+#export NVSHMEM_DEBUG=INFO
+
 export PATH=/opt/nvidia/nsight-systems/2025.1.1/bin:$PATH
-#nsys_args="nsys profile --stats true -w true -t cuda,nvtx,osrt,cudnn,cublas --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_internode_${WORLD_SIZE}.torch"
+#nsys_args="nsys profile --stats true -w true -t cuda,nvtx,cudnn,cublas --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_simple_kernel_${WORLD_SIZE}.torch"
+#nsys_args="nsys profile --stats true -w true -t cuda,nvtx --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_internode_${WORLD_SIZE}nodes_rank${RANK}.torch"
 
 rm -rf core.*
 
 ${nsys_args} python test_internode.py
+#${nsys_args} python test_simple.py

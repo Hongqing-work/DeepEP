@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -72,7 +73,7 @@ def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_gro
     return (scores * mask).view(num_tokens, num_experts)
 
 
-def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
+def bench(group, fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
     # Flush L2 cache with 256 MB data
     torch.cuda.synchronize()
     cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
@@ -87,6 +88,11 @@ def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
     # Testing
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+
+    group.barrier()
+    torch.cuda.synchronize()
+
+    cpu_start = time.time()
     for i in range(num_tests):
         # Record
         start_events[i].record()
@@ -95,9 +101,10 @@ def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
         if post_fn is not None:
             post_fn()
     torch.cuda.synchronize()
+    cpu_runtime = time.time() - cpu_start
 
     times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
-    return np.average(times), np.min(times), np.max(times)
+    return np.average(times), np.min(times), np.max(times), cpu_runtime / num_tests
 
 
 class empty_suppress:
@@ -227,3 +234,28 @@ def dump(x, name, local_rank):
         np.save(f"{name}_rank{local_rank}.npy", np.zeros(5))
     else:
         assert False, f'{name}: {x}'
+
+
+def load(name, local_rank, typehint="tensor"):
+    dump_dir = '/root/paddlejob/workspace/env_run/liuyiqun/outputs/torch_dump'
+    name = dump_dir + "/" + name
+    print(f"[local_rank={local_rank}] load {name}")
+    # orig_dtype = retrive_dtype(name)
+    # name += dtype2str[x.dtype]
+    if typehint == "tensor":
+        x_np = np.load(f'{name}_rank{local_rank}.npy')
+        if x_np.dtype == np.uint16:
+            x = torch.tensor(x_np, device='cuda').view(torch.bfloat16)
+        elif x_np.dtype == np.uint8:
+            x = torch.tensor(x_np, device='cuda').view(torch.float8_e4m3fn)
+        else:
+            x = torch.tensor(x_np, device='cuda')
+        return x
+    elif typehint == "tuple":
+        y_np = np.load(f'{name}_value_rank{local_rank}.npy')
+        y_scale_np = np.load(f'{name}_scale_rank{local_rank}.npy')
+        y = torch.tensor(y_np, device='cuda').view(torch.float8_e4m3fn)
+        y_scale = torch.tensor(y_scale_np, device='cuda')
+        return (y, y_scale)
+    else:
+        assert False, f'invalid typehint: {typehint}'

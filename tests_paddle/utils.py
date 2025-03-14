@@ -1,9 +1,37 @@
 import os
 import sys
+import time
 import numpy as np
 import paddle
 import paddle.distributed as dist
 from typing import Optional
+
+
+def init_dist(num_local_ranks: int):
+    # NOTES: you may rewrite this function with your own cluster settings
+    ip = os.getenv('MASTER_ADDR', '127.0.0.1')
+    port = int(os.getenv('MASTER_PORT', '8361'))
+    num_nodes = int(os.getenv('WORLD_SIZE', 1))
+    node_rank = int(os.getenv('RANK', 0))
+    print(f"num_nodes: {num_nodes}, node_rank: {node_rank}")
+    assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
+
+    dist.init_parallel_env() 
+    #dist.init_process_group(
+    #    backend='nccl',
+    #    init_method=f'tcp://{ip}:{port}',
+    #    world_size=num_nodes * num_local_ranks,
+    #    rank=node_rank * num_local_ranks + local_rank
+    #)
+
+    rank = dist.get_rank()
+    local_rank = rank % num_local_ranks
+
+    paddle.set_default_dtype(paddle.bfloat16)
+    #paddle.set_default_device('cuda')
+    #paddle.set_device(f"cuda:{local_rank}")
+
+    return local_rank, rank, dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
 
 #def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -57,7 +85,7 @@ def create_grouped_scores(scores: paddle.Tensor, group_idx: paddle.Tensor, num_g
     return (scores * mask).view([num_tokens, num_experts])
 
 
-def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
+def bench(group, fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
     # Flush L2 cache with 256 MB data
     paddle.device.cuda.synchronize()
     cache = paddle.empty([int(256e6 // 4)], dtype=paddle.int32)
@@ -72,6 +100,11 @@ def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
     # Testing
     start_events = [paddle.device.cuda.Event(enable_timing=True) for _ in range(num_tests)]
     end_events = [paddle.device.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+
+    paddle.distributed.barrier(group)
+    paddle.device.cuda.synchronize()
+
+    cpu_start = time.time()
     for i in range(num_tests):
         # Record
         start_events[i].record()
@@ -80,9 +113,10 @@ def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
         if post_fn is not None:
             post_fn()
     paddle.device.cuda.synchronize()
+    cpu_runtime = time.time() - cpu_start
 
     times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
-    return np.average(times), np.min(times), np.max(times)
+    return np.average(times), np.min(times), np.max(times), cpu_runtime / num_tests
 
 
 class empty_suppress:
@@ -237,6 +271,7 @@ def retrive_dtype(name):
 def load(name, local_rank, typehint="tensor"):
     dump_dir = '/root/paddlejob/workspace/env_run/liuyiqun/outputs/torch_dump'
     name = dump_dir + "/" + name
+    print(f"[local_rank={local_rank}] load {name}")
     # orig_dtype = retrive_dtype(name)
     # name += dtype2str[x.dtype]
     if typehint == "tensor":
