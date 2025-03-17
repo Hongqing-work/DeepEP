@@ -14,39 +14,49 @@ import test_low_latency
 from paperf import profile_torch
 
 
-def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup, dump_input, dump_output):
+def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup, use_random_input, dump_input, dump_output):
     # Settings
     num_tokens, hidden, num_topk_groups, num_topk, num_experts = 4096, 7168, min(num_nodes, 4), 8, (256 // num_ranks) * num_ranks
     assert num_experts % num_ranks == 0 and num_local_ranks == 8
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
 
-    # Random data
-    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
-    x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    x_e4m3 = per_token_cast_to_fp8(x)
+    if use_random_input:
+        # Random data
+        x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
+        x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        x_e4m3 = per_token_cast_to_fp8(x)
 
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
-    group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
-    group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
-    masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
+        scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+        group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
+        group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
+        masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
 
-    topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
-    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
-    topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+        topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+        topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
+        topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
 
-    if dump_input:
-        utils.dump(x, 'x', local_rank)
-        utils.dump(x_pure_rand, 'x_pure_rand', local_rank)
-        utils.dump(x_e4m3, 'x_e4m3', local_rank)
+        if dump_input:
+            utils.dump(x, 'x', local_rank)
+            utils.dump(x_pure_rand, 'x_pure_rand', local_rank)
+            utils.dump(x_e4m3, 'x_e4m3', local_rank)
 
-        utils.dump(topk_idx, 'topk_idx', local_rank)
-        utils.dump(topk_weights, 'topk_weights', local_rank)
-        utils.dump(topk_weights_pure_rand, 'topk_weights_pure_rand', local_rank)
+            utils.dump(topk_idx, 'topk_idx', local_rank)
+            utils.dump(topk_weights, 'topk_weights', local_rank)
+            utils.dump(topk_weights_pure_rand, 'topk_weights_pure_rand', local_rank)
+    else:
+        x = utils.load("x", local_rank)
+        x_pure_rand = utils.load("x_pure_rand", local_rank)
+        x_e4m3 = utils.load("x_e4m3", local_rank, "tuple")
+
+        topk_idx = utils.load("topk_idx", local_rank)
+        topk_weights = utils.load("topk_weights", local_rank)
+        topk_weights_pure_rand = utils.load("topk_weights_pure_rand", local_rank)
 
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx.masked_fill_(topk_idx == -1, -1)
     inplace_unique(rank_idx, num_ranks)
+
     rdma_rank_idx = rank_idx // num_local_ranks
     rdma_rank_idx.masked_fill_(rank_idx == -1, -1)
     inplace_unique(rdma_rank_idx, num_nodes)
@@ -62,38 +72,50 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     num_rdma_only_token_sent = mask_rdma_only.sum().item()
     print(f"-- [local_rank={local_rank}, rank={rank}] num_rdma_token_sent: {num_rdma_token_sent}, num_rdma_token_sent_rdma_only: {num_rdma_only_token_sent}")
 
-    # Expert meta
-    num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
-    for i in range(num_experts):
-        num_tokens_per_expert[i] = (topk_idx == i).sum()
-    gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
-    dist.all_reduce(gbl_num_tokens_per_expert, group=group)
+    if use_random_input:
+        # Expert meta
+        num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
+        for i in range(num_experts):
+            num_tokens_per_expert[i] = (topk_idx == i).sum()
+        gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
+        dist.all_reduce(gbl_num_tokens_per_expert, group=group)
 
-    # Rank layout meta
-    num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device='cuda')
-    num_tokens_per_rdma_rank = torch.empty((num_nodes, ), dtype=torch.int, device='cuda')
-    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
-    for i in range(num_ranks):
-        num_tokens_per_rank[i] = (rank_idx == i).sum()
-        token_sel = (rank_idx == i).max(dim=-1)[0]
-        count = token_sel.sum().item()
-        tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
-        tokens[:count] = torch.sort(tokens[:count])[0]
-        token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
-    for i in range(num_nodes):
-        num_tokens_per_rdma_rank[i] = (rdma_rank_idx == i).sum()
-    token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
-    is_token_in_rank = token_idx_in_rank >= 0
-    gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
-    dist.all_reduce(gbl_num_tokens_per_rank, group=group)
+        # Rank layout meta
+        num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device='cuda')
+        num_tokens_per_rdma_rank = torch.empty((num_nodes, ), dtype=torch.int, device='cuda')
+        token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+        for i in range(num_ranks):
+            num_tokens_per_rank[i] = (rank_idx == i).sum()
+            token_sel = (rank_idx == i).max(dim=-1)[0]
+            count = token_sel.sum().item()
+            tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+            tokens[:count] = torch.sort(tokens[:count])[0]
+            token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
+        for i in range(num_nodes):
+            num_tokens_per_rdma_rank[i] = (rdma_rank_idx == i).sum()
+        token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
+        is_token_in_rank = token_idx_in_rank >= 0
+        gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
+        dist.all_reduce(gbl_num_tokens_per_rank, group=group)
 
-    if dump_input:
-        utils.dump(num_tokens_per_rank, 'num_tokens_per_rank', local_rank)
-        utils.dump(num_tokens_per_rdma_rank, 'num_tokens_per_rdma_rank', local_rank)
-        utils.dump(is_token_in_rank, 'is_token_in_rank', local_rank)
-        utils.dump(num_tokens_per_expert, 'num_tokens_per_expert', local_rank)
-        utils.dump(gbl_num_tokens_per_rank, 'gbl_num_tokens_per_rank', local_rank)
-        utils.dump(gbl_num_tokens_per_expert, 'gbl_num_tokens_per_expert', local_rank)
+        if dump_input:
+            utils.dump(num_tokens_per_rank, 'num_tokens_per_rank', local_rank)
+            utils.dump(num_tokens_per_rdma_rank, 'num_tokens_per_rdma_rank', local_rank)
+            utils.dump(is_token_in_rank, 'is_token_in_rank', local_rank)
+            utils.dump(num_tokens_per_expert, 'num_tokens_per_expert', local_rank)
+            utils.dump(gbl_num_tokens_per_rank, 'gbl_num_tokens_per_rank', local_rank)
+            utils.dump(gbl_num_tokens_per_expert, 'gbl_num_tokens_per_expert', local_rank)
+    else:
+        num_tokens_per_rank = utils.load('num_tokens_per_rank', local_rank)
+        num_tokens_per_rdma_rank = utils.load('num_tokens_per_rdma_rank', local_rank)
+        is_token_in_rank = utils.load('is_token_in_rank', local_rank)
+        num_tokens_per_expert = utils.load('num_tokens_per_expert', local_rank)
+        gbl_num_tokens_per_rank = utils.load('gbl_num_tokens_per_rank', local_rank)
+        gbl_num_tokens_per_expert = utils.load('gbl_num_tokens_per_expert', local_rank)
+
+    ############################################################################################################
+    # get_dispatch_layout
+    ############################################################################################################
 
     ref_num_tokens_per_rank, ref_num_tokens_per_rdma_rank, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
@@ -116,6 +138,8 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     group.barrier()
     time.sleep(1)
 
+    ############################################################################################################
+
     # Config
     rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (144, 160) else 512)
     config = deep_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
@@ -134,9 +158,10 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         for async_mode in (False, True):
             for current_x in (x_pure_rand, x, x_e4m3):
                 for with_topk in (False, True):
-                    dump_prefix = f'{"FP8" if isinstance(current_x, tuple) else "BF16"}_{"with" if with_topk else "without"}_top-k_async_{async_mode}_previous_{previous_mode}_'
+                    dtype_str = "FP8" if isinstance(current_x, tuple) else "BF16"
+                    dump_prefix = f'{dtype_str}_{"with" if with_topk else "without"}_top-k_async_{async_mode}_previous_{previous_mode}_'
                     if local_rank == 0:
-                        print(f'[testing] Running with {"FP8" if isinstance(current_x, tuple) else "BF16"}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...', flush=True, end='')
+                        print(f'[testing] Running with {dtype_str}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...', flush=True, end='')
 
                     dispatch_args = {
                         'x': current_x,
@@ -152,6 +177,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                             'topk_idx': topk_idx,
                             'topk_weights': topk_weights_pure_rand if current_x is x_pure_rand else topk_weights
                         })
+
                     if previous_mode:
                         dispatch_args.update({'previous_event': buffer.capture()})
 
@@ -193,6 +219,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         dispatch_args = {'x': current_x, 'handle': handle, 'config': config, 'async_finish': async_mode}
                         if previous_mode:
                             dispatch_args.update({'previous_event': buffer.capture()})
+
                         recv_x, _, _, _, _, event = buffer.dispatch(**dispatch_args)
                         event.current_stream_wait() if async_mode else ()
 
@@ -204,7 +231,11 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                             check_data(recv_x, recv_gbl_rank_prefix_sum)
 
                     # Test combine
+                    if not use_random_input:
+                        recv_x = utils.load(f"{dump_prefix}recv_x_combine_input", local_rank)
+
                     combine_args = {'x': recv_x, 'handle': handle, 'config': config, 'async_finish': async_mode}
+
                     if with_topk:
                         combine_args.update({'topk_weights': recv_topk_weights})
 
@@ -214,6 +245,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                             utils.dump(recv_topk_weights, f'{dump_prefix}recv_topk_weights_input', local_rank)
                     if previous_mode:
                         dispatch_args.update({'previous_event': buffer.capture()})
+
                     combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
                     event.current_stream_wait() if async_mode else ()
 
@@ -269,7 +301,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
             for rdma_chunk_size in range(4, 33, 4):
                 config_str = f"sms={num_sms},nvl={nvl_chunk_size},{nvl_buffer_size},rdma={rdma_chunk_size},{rdma_buffer_size}"
                 if profile:
-                    profile_torch.push_record_event(f"Config({config_str})")
+                    profile_torch.push_record_event(f"Dispatch_{dtype_str}_Config({config_str})")
 
                 config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
                 tune_args = {'x': current_x, 'handle': handle, 'config': config}
@@ -302,7 +334,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
         if isinstance(current_x, tuple):
             if profile:
-                profile_torch.push_record_event("gather_best_config")
+                profile_torch.push_record_event("Gather_Best_Config")
 
             # Gather FP8 the best config from rank 0
             best_dispatch_results = torch.tensor([best_results[0], best_results[1], best_results[2]], dtype=torch.int32, device='cuda')
@@ -318,7 +350,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
     config_str = f"sms={best_dispatch_results[0]},nvl={best_dispatch_results[1]},{nvl_buffer_size},rdma={best_dispatch_results[2]},{rdma_buffer_size}"
     if profile:
-        profile_torch.push_record_event(f"Dispatch_BF16_Config({config_str})")
+        profile_torch.push_record_event(f"Best_Dispatch_BF16_Config({config_str})")
 
     dispatch_config = deep_ep.Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2], rdma_buffer_size)
     #dispatch_config = deep_ep.Config(24, 20, 512, 32, 128)
@@ -354,7 +386,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         for rdma_chunk_size in range(8, 33, 4):
             config_str = f"sms={num_sms},nvl={nvl_chunk_size},{nvl_buffer_size},rdma={rdma_chunk_size},{rdma_buffer_size}"
             if profile:
-                profile_torch.push_record_event(f"Config({config_str})")
+                profile_torch.push_record_event(f"Combine_BF16_Config({config_str})")
 
             config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
             tune_args = {'x': recv_x, 'handle': handle, 'config': config}
@@ -401,10 +433,11 @@ def test_loop(local_rank: int, num_local_ranks: int):
     assert num_local_ranks == 8 and num_ranks > 8
     torch.manual_seed(rank)
 
+    use_random_input = True
     dump_input = False
     dump_output = False
     for i in (24, ):
-        test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, dump_input, dump_output)
+        test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, use_random_input, dump_input, dump_output)
         if local_rank == 0:
             print()
 

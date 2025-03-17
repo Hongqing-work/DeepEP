@@ -4,6 +4,8 @@ WORK_ROOT=/root/paddlejob/workspace/env_run/liuyiqun
 export PYTHONPATH=${WORK_ROOT}/env/virtualenvs_cuda12.8/torch_py310_yiqun
 export PATH=${PYTHONPATH}/bin:${PATH}
 
+python -c "import torch; print(torch.__version__)"
+
 export PYTHONPATH=${WORK_ROOT}/PaPerf:$PYTHONPATH
 
 #export NVSHMEM_DIR=$ROOT_DIR/third-party/nvshmem
@@ -11,21 +13,19 @@ export PYTHONPATH=${WORK_ROOT}/PaPerf:$PYTHONPATH
 
 export MASTER_ADDR=10.54.95.204
 export MASTER_PORT=8367
-export WORLD_SIZE=2
-#export RANK=$(($PADDLE_TRAINER_ID - 2))
-export RANK=$PADDLE_TRAINER_ID
+export WORLD_SIZE=8
 
-if [ ${PADDLE_TRAINER_ID} -ge ${WORLD_SIZE} ]; then
+START_NODE=0
+END_NODE=$((${START_NODE} + ${WORLD_SIZE}))
+export RANK=$(($PADDLE_TRAINER_ID - ${START_NODE}))
+
+if [ ${PADDLE_TRAINER_ID} -lt ${START_NODE} ]; then
+  echo "$PADDLE_TRAINER_ID exit"
+  exit
+elif [ ${PADDLE_TRAINER_ID} -ge ${END_NODE} ]; then
   echo "$PADDLE_TRAINER_ID exit"
   exit
 fi
-#if [ ${PADDLE_TRAINER_ID} -lt 2 ]; then
-#  echo "$PADDLE_TRAINER_ID exit"
-#  exit
-#elif [ ${PADDLE_TRAINER_ID} -gt 3 ]; then
-#  echo "$PADDLE_TRAINER_ID exit"
-#  exit
-#fi
 
 export NCCL_DEBUG=WARN
 #export NVSHMEM_DEBUG=DEBUG
@@ -53,7 +53,7 @@ export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME==xgbe0
 
 export PATH=/opt/nvidia/nsight-systems/2025.1.1/bin:$PATH
 #nsys_args="nsys profile --stats true -w true -t cuda,nvtx,cudnn,cublas --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_simple_kernel_${WORLD_SIZE}.torch"
-#nsys_args="nsys profile --stats true -w true -t cuda,nvtx --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_internode_${WORLD_SIZE}nodes_rank${RANK}.torch"
+#nsys_args="nsys profile --stats true -w true -t cuda,nvtx --nic-metrics=true --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_internode_${WORLD_SIZE}nodes_rank${RANK}.torch"
 
 rm -rf core.*
 
