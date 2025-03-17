@@ -2,9 +2,7 @@ import os
 import sys
 import time
 
-import torch
 import paddle
-
 import paddle.distributed as dist
 import paddle.distributed.fleet as fleet
 import paddle.distributed.communication.deep_ep as deep_ep
@@ -18,7 +16,11 @@ from utils import bench, create_grouped_scores, inplace_unique, per_token_cast_t
 
 # Test compatibility with low latency functions
 #import test_low_latency
-from paperf import profile_paddle
+try:
+    from paperf import profile_paddle
+    has_paperf = True
+except ImportError:
+    has_paperf = False
 
 
 def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: Group, use_random_input: bool, dump_input: bool, dump_output: bool, tune_performance: bool):
@@ -114,10 +116,10 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         buffer.get_dispatch_layout(topk_idx, num_experts)
 
     if dump_output:
-        utils.dump(ref_num_tokens_per_rank, "ref_num_tokens_per_rank", local_rank)
-        utils.dump(ref_num_tokens_per_rdma_rank, "ref_num_tokens_per_rdma_rank", local_rank)
-        utils.dump(ref_num_tokens_per_expert, "ref_num_tokens_per_expert", local_rank)
-        utils.dump(ref_is_token_in_rank, "ref_is_token_in_rank", local_rank)    
+        utils.dump(ref_num_tokens_per_rank, 'ref_num_tokens_per_rank', local_rank)
+        utils.dump(ref_num_tokens_per_rdma_rank, 'ref_num_tokens_per_rdma_rank', local_rank)
+        utils.dump(ref_num_tokens_per_expert, 'ref_num_tokens_per_expert', local_rank)
+        utils.dump(ref_is_token_in_rank, 'ref_is_token_in_rank', local_rank)
 
     assert paddle.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
     assert paddle.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
@@ -128,7 +130,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     if local_rank == 0:
         print(f'[layout] Kernel performance: {t * 1000:.3f} ms', flush=True)
         print()
-    paddle.distributed.barrier()
+    paddle.distributed.barrier(group)
     time.sleep(1)
 
     ############################################################################################################
@@ -139,23 +141,23 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
     # Test dispatch
     # noinspection PyShadowingNames
-    # def check_data(check_x, recv_gbl_rank_prefix_sum):
-    #     assert paddle.allclose(check_x.amin(axis=1), check_x.amax(axis=1))
-    #     check_start = 0
-    #     for i in range(num_ranks):
-    #         check_end = recv_gbl_rank_prefix_sum[i].item()
-    #         assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
-    #         check_start = check_end
+    def check_data(check_x, recv_gbl_rank_prefix_sum):
+        assert paddle.allclose(check_x.amin(axis=1), check_x.amax(axis=1))
+        check_start = 0
+        for i in range(num_ranks):
+            check_end = recv_gbl_rank_prefix_sum[i].item()
+            assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
+            check_start = check_end
 
     for previous_mode in (False, True):
         for async_mode in (False, True):
             for current_x in (x_pure_rand, x, x_e4m3):
                 for with_topk in (False, True):
                     dtype_str = "FP8" if isinstance(current_x, tuple) else "BF16"
+                    dump_prefix = f'{dtype_str}_{"with" if with_topk else "without"}_top-k_async_{async_mode}_previous_{previous_mode}_'
                     if local_rank == 0:
                         print(f'[testing] Running with {dtype_str}, {"with" if with_topk else "without"} top-k (async={async_mode}, previous={previous_mode}) ...', flush=True, end='\n')
 
-                    dump_prefix = f'{dtype_str}_{"with" if with_topk else "without"}_top-k_async_{async_mode}_previous_{previous_mode}_'
 
                     dispatch_args = {
                         'x': current_x,
@@ -179,10 +181,10 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                     event.current_stream_wait() if async_mode else ()
 
                     if dump_output:
-                        utils.dump(recv_x, f"{dump_prefix}recv_x", local_rank)
-                        utils.dump(recv_topk_idx, f"{dump_prefix}recv_topk_idx", local_rank)
-                        utils.dump(recv_topk_weights, f"{dump_prefix}recv_topk_weights", local_rank)
-                        utils.dump(recv_num_tokens_per_expert_list, f"{dump_prefix}recv_num_tokens_per_expert_list", local_rank)
+                        utils.dump(recv_x, f'{dump_prefix}recv_x', local_rank)
+                        utils.dump(recv_topk_idx, f'{dump_prefix}recv_topk_idx', local_rank)
+                        utils.dump(recv_topk_weights, f'{dump_prefix}recv_topk_weights', local_rank)
+                        utils.dump(recv_num_tokens_per_expert_list, f'{dump_prefix}recv_num_tokens_per_expert_list', local_rank)
 
                     recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
 
@@ -199,9 +201,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         # check_data(recv_x, recv_gbl_rank_prefix_sum)
                     if with_topk:
                         # Check `topk_idx`
-                        #assert (recv_topk_idx.equal(-1) | ((recv_topk_idx >= 0) & (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
-                        #for i, count in enumerate(recv_num_tokens_per_expert_list):
-                        #    assert recv_topk_idx.equal(i).sum().item() == count
+                        assert (recv_topk_idx.equal(-1) | ((recv_topk_idx >= 0) & (recv_topk_idx < (num_experts // num_ranks)))).sum().item() == recv_topk_idx.numel()
+                        for i, count in enumerate(recv_num_tokens_per_expert_list):
+                            assert recv_topk_idx.equal(i).sum().item() == count
 
                         if use_random_input:
                             # Check `topk_weights`
@@ -220,7 +222,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                         event.current_stream_wait() if async_mode else ()
 
                         if dump_output:
-                            utils.dump(recv_x, f"{dump_prefix}recv_x_wo_topk", local_rank)
+                            utils.dump(recv_x, f'{dump_prefix}recv_x_wo_topk', local_rank)
 
                         recv_x = per_token_cast_back(*recv_x) if isinstance(recv_x, tuple) else recv_x
 
@@ -235,16 +237,15 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
                     combine_args = {'x': recv_x, 'handle': handle, 'config': config, 'async_finish': async_mode}
 
-                    if dump_input:
-                        utils.dump(recv_x, f"{dump_prefix}recv_x_combine_input", local_rank)
-
                     if with_topk:
                         if not use_random_input:
                             recv_topk_weights = utils.load(f"{dump_prefix}recv_topk_weights_input", local_rank)
                         combine_args.update({'topk_weights': recv_topk_weights})
-                        if dump_input:
-                            print("-- [dump_input recv_topk_weights]", end=" ")
-                            utils.dump(recv_topk_weights, f"{dump_prefix}recv_topk_weights_input", local_rank)
+
+                    if dump_input:
+                        utils.dump(recv_x, f'{dump_prefix}recv_x_combine_input', local_rank)
+                        if with_topk:
+                            utils.dump(recv_topk_weights, f'{dump_prefix}recv_topk_weights_input', local_rank)
                     if previous_mode:
                         dispatch_args.update({'previous_event': buffer.capture()})
 
@@ -283,6 +284,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         print(f"-- {name}: data_ptr={t.data_ptr()}, shape={t.shape}, dtype={t.dtype}") 
 
     profile = False
+    profile = profile and has_paperf
 
     if profile:
         profile_paddle.switch_profile(0, 0, 1)
@@ -305,7 +307,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
             for rdma_chunk_size in range(4, 33, 4):
                 config_str = f"sms={num_sms},nvl={nvl_chunk_size},{nvl_buffer_size},rdma={rdma_chunk_size},{rdma_buffer_size}"
                 if profile:
-                    profile_paddle.push_record_event(f"Config({config_str})")
+                    profile_paddle.push_record_event(f"Dispatch_{dtype_str}_Config({config_str})")
 
                 config = Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
                 tune_args = {'x': current_x, 'handle': handle, 'config': config}
@@ -338,7 +340,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
         if isinstance(current_x, tuple):
             if profile:
-                profile_paddle.push_record_event("gather_best_config")
+                profile_paddle.push_record_event("Gather_Best_Config")
 
             # Gather FP8 the best config from rank 0
             best_dispatch_results = paddle.to_tensor([best_results[0], best_results[1], best_results[2]], dtype=paddle.int32)
@@ -354,7 +356,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
     config_str = f"sms={best_dispatch_results[0]},nvl={best_dispatch_results[1]},{nvl_buffer_size},rdma={best_dispatch_results[2]},{rdma_buffer_size}"
     if profile:
-        profile_paddle.push_record_event(f"Dispatch_BF16_Config({config_str})")
+        profile_paddle.push_record_event(f"Best_Dispatch_BF16_Config({config_str})")
 
     dispatch_config = Config(best_dispatch_results[0], best_dispatch_results[1], nvl_buffer_size, best_dispatch_results[2], rdma_buffer_size)
     #dispatch_config = Config(24, 20, 512, 32, 128)
@@ -390,7 +392,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         for rdma_chunk_size in range(8, 33, 4):
             config_str = f"sms={num_sms},nvl={nvl_chunk_size},{nvl_buffer_size},rdma={rdma_chunk_size},{rdma_buffer_size}"
             if profile:
-                profile_paddle.push_record_event(f"Config({config_str})")
+                profile_paddle.push_record_event(f"Combine_BF16_Config({config_str})")
 
             config = Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
             tune_args = {'x': recv_x, 'handle': handle, 'config': config}
@@ -413,7 +415,8 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     if profile:
         profile_paddle.pop_record_event()
 
-    profile_paddle.switch_profile(1, 0, 1)
+    if profile:
+        profile_paddle.switch_profile(1, 0, 1)
 
     if local_rank == 0:
         combine_bf16_rdma_recv_GBs = combine_bf16_rdma_recv_bytes / 1e9 / best_time
@@ -424,7 +427,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
 
 # noinspection PyUnboundLocalVariable
-def test_loop():
+def test_loop(num_local_ranks):
     # Please make sure AR (Adaptive Routing) is turned off when running normal internode kernels,
     # rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     test_ll_compatibility = False
@@ -440,7 +443,6 @@ def test_loop():
     num_ranks = dist.get_world_size(ep_group)
     rank = dist.get_rank(ep_group)
 
-    num_local_ranks = 8
     num_nodes = int(num_ranks / 8)
     local_rank = rank % 8
     print(f'local_rank:{local_rank}, num_local_ranks:{num_local_ranks}, num_ranks:{num_ranks}, rank:{rank}')
@@ -448,7 +450,7 @@ def test_loop():
     assert num_local_ranks == 8 and num_ranks > 8
     paddle.seed(rank)
 
-    use_random_input = False
+    use_random_input = True
     dump_input = False
     dump_output = False
     tune_performance = True
@@ -465,13 +467,13 @@ def test_loop():
 
 
 if __name__ == '__main__':
-    #num_processes = 8
+    num_processes = 8
     #torch.multiprocessing.spawn(test_loop, args=(num_processes, ), nprocs=num_processes)
     world_size = int(os.getenv('WORLD_SIZE', 1))
-    mp_degree = world_size * 8
+    mp_degree = world_size * num_processes
     strategy = fleet.DistributedStrategy()
     strategy.hybrid_configs = {
         "mp_degree": mp_degree,
     }
     fleet.init(is_collective=True, strategy=strategy)
-    test_loop()
+    test_loop(num_processes)

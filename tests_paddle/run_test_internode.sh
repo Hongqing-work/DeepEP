@@ -3,11 +3,11 @@
 #bash kill_process.sh
 
 WORK_ROOT=/root/paddlejob/workspace/env_run/liuyiqun
-export PYTHONPATH=${WORK_ROOT}/env/virtualenvs_cuda12.8/paddle_py310_yiqun
+export PYTHONPATH=${WORK_ROOT}/env/virtualenvs_cuda12.8/new_paddle_py310_yiqun
 export PATH=${PYTHONPATH}/bin:${PATH}
 
 python -c "import paddle; print(paddle.version.commit)"
-python -c "import torch; print(torch.__version__)"
+#python -c "import torch; print(torch.__version__)"
 
 #export NVSHMEM_DIR=${WORK_ROOT}/Paddle/build_paddle/third_party_cuda12.3_gcc12.2.0_py3.10/install/nvshmem
 #export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH"
@@ -15,7 +15,7 @@ python -c "import torch; print(torch.__version__)"
 
 export PYTHONPATH=${WORK_ROOT}/PaPerf:$PYTHONPATH
 #export LD_LIBRARY_PATH=/root/paddlejob/workspace/env_run/liuyiqun/DeepEP/tests_paddle:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=/root/paddlejob/workspace/env_run/liuyiqun/Paddle/paddle/fluid/distributed/collective/deep_ep/kernels/build:$LD_LIBRARY_PATH
+#export LD_LIBRARY_PATH=/root/paddlejob/workspace/env_run/liuyiqun/Paddle/paddle/fluid/distributed/collective/deep_ep/kernels/build:$LD_LIBRARY_PATH
 
 
 # 屏蔽平台预设的环境变量，因为框架采用兼容升级，检测到这些配置会使用原方式启动
@@ -25,14 +25,19 @@ unset DISTRIBUTED_TRAINER_ENDPOINTS
 unset FLAGS_START_PORT
 unset PADDLE_ELASTIC_TIMEOUT
 
-export MASTER_ADDR=10.54.95.204
-export MASTER_PORT=58978
-export WORLD_SIZE=2
-#nnodes=$PADDLE_TRAINERS_NUM
-export NNODES=${WORLD_SIZE}
-export RANK=$PADDLE_TRAINER_ID
+export WORLD_SIZE=8
 
-if [ ${PADDLE_TRAINER_ID} -ge ${WORLD_SIZE} ]; then
+MASTER_ADDR=10.54.95.204
+MASTER_PORT=58978
+NNODES=${WORLD_SIZE}
+START_NODE=0
+END_NODE=$((${START_NODE} + ${WORLD_SIZE}))
+RANK=$(($PADDLE_TRAINER_ID - ${START_NODE}))
+
+if [ ${PADDLE_TRAINER_ID} -lt ${START_NODE} ]; then
+  echo "$PADDLE_TRAINER_ID exit"
+  exit
+elif [ ${PADDLE_TRAINER_ID} -ge ${END_NODE} ]; then
   echo "$PADDLE_TRAINER_ID exit"
   exit
 fi
@@ -62,14 +67,18 @@ export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME==xgbe0
 
 #export NVSHMEM_CUMEM_GRANULARITY=2M
 
+#export NVSHMEM_NVTX=common
 #export NVSHMEM_DEBUG=INFO
+#export NVSHMEM_INFO=1
 #export GLOG_vmodule=deep_ep=4
 
 #export FLAGS_use_nvml=False
 
-export PATH=/opt/nvidia/nsight-systems/2025.1.1/bin:$PATH
-#nsys_args="nsys profile --stats true -w true -t cuda,nvtx --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_internode_${WORLD_SIZE}nodes_rank${RANK}.paddle"
-#nsys_args="nsys profile --stats true -w true -t cuda,nvtx --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_simple_${WORLD_SIZE}.paddle"
+export PATH=/opt/nvidia/nsight-systems/2025.1.1/bin:/usr/local/NVIDIA-Nsight-Compute-2025.1/bin:$PATH
+#nsys_args="nsys profile --stats true -w true -t cuda,nvshmem,nvtx -r um_cpu_page_faults_sum --nic-metrics=true --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_internode_${WORLD_SIZE}nodes_rank${RANK}.paddle"
+#nsys_args="nsys profile --stats true -w true -t cuda,nvtx --nic-metrics=true --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_internode_${WORLD_SIZE}nodes_rank${RANK}.paddle"
+#nsys_args="nsys profile --stats true -w true -t cuda,nvshmem,nvtx --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_simple_${WORLD_SIZE}.paddle"
+#nsys_args="ncu --target-processes all"
 
 rm -rf core.*
 rm -rf log

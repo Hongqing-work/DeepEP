@@ -87,7 +87,7 @@ def create_grouped_scores(scores: paddle.Tensor, group_idx: paddle.Tensor, num_g
 
 def bench(group, fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
     # Flush L2 cache with 256 MB data
-    paddle.device.cuda.synchronize()
+    paddle.device.synchronize()
     cache = paddle.empty([int(256e6 // 4)], dtype=paddle.int32)
 
     # Warmup
@@ -102,7 +102,7 @@ def bench(group, fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
     end_events = [paddle.device.cuda.Event(enable_timing=True) for _ in range(num_tests)]
 
     paddle.distributed.barrier(group)
-    paddle.device.cuda.synchronize()
+    paddle.device.synchronize()
 
     cpu_start = time.time()
     for i in range(num_tests):
@@ -112,7 +112,7 @@ def bench(group, fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
         end_events[i].record()
         if post_fn is not None:
             post_fn()
-    paddle.device.cuda.synchronize()
+    paddle.device.synchronize()
     cpu_runtime = time.time() - cpu_start
 
     times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]

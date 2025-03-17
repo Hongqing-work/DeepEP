@@ -11,7 +11,11 @@ from utils import init_dist, bench, calc_diff, create_grouped_scores, inplace_un
 
 # Test compatibility with low latency functions
 import test_low_latency
-from paperf import profile_torch
+try:
+    from paperf import profile_torch
+    has_paperf = True
+except ImportError:
+    has_paperf = False
 
 
 def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup, use_random_input, dump_input, dump_output):
@@ -279,6 +283,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         print(f"-- {name}: shape={t.size()}, dtype={t.dtype}")
 
     profile = False
+    profile = profile and has_paperf
 
     if profile:
         profile_torch.switch_profile(0, 0, 1)

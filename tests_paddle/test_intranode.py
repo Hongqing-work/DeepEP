@@ -15,6 +15,12 @@ import numpy as np
 
 # Test compatibility with low latency functions
 # import test_low_latency
+try:
+    from paperf import profile_paddle
+    has_paperf = True
+except ImportError:
+    has_paperf = False
+
 
 def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
     # Flush L2 cache with 256 MB data
@@ -118,9 +124,11 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
     ref_num_tokens_per_rank, _, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
+
     assert paddle.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
     assert paddle.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
     assert paddle.allclose(ref_is_token_in_rank, is_token_in_rank)
+
     t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
     if local_rank == 0:
         print(f'[layout] Kernel performance: {t * 1000:.3f} ms', flush=True)
@@ -255,7 +263,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     dispatch_args = {'x': x, 'num_tokens_per_rank': num_tokens_per_rank,
                      'is_token_in_rank': is_token_in_rank, 'num_tokens_per_expert': num_tokens_per_expert,
                      'config': dispatch_config if dispatch_config is not None else config}
-    recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
+
+    for i in range(1):
+        recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
 
     # Tune combine performance
     best_time, best_results = 1e10, None
