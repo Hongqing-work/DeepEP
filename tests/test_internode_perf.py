@@ -10,6 +10,8 @@ import deep_ep
 import utils
 from utils import init_dist, bench, calc_diff, create_grouped_scores, inplace_unique, per_token_cast_to_fp8, per_token_cast_back
 
+import alltoall
+
 try:
     from paperf import profile_torch
     has_paperf = True
@@ -106,9 +108,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         if profile:
             profile_torch.pop_record_event()
 
-    ############################################################################################################
-    # get_dispatch_layout
-    ############################################################################################################
+    if buffer is None:
+        #buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=False)
+        buffer = alltoall.get_buffer(group, hidden * 2)
 
     if profile:
         profile_torch.push_record_event(f"get_dispatch_layout")
@@ -124,108 +126,91 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     if profile:
         profile_torch.pop_record_event()
 
+    if profile:
+        profile_torch.push_record_event(f"barrier")
+
     torch.distributed.barrier()
     #group.barrier()
-    time.sleep(1)
-
-    # Config
-    rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (144, 160) else 512)
-    handle = None
-
-    if local_rank == 0:
-        print()
-
-    # Tune dispatch performance
-    best_dispatch_results = None
-    fp8_factor = (1 + 4 / 128) / 2
-    #current_x_list = [x_e4m3, x]
-    current_x_list = [x]
-    for current_x in current_x_list:
-        dtype_str = "FP8" if isinstance(current_x, tuple) else "BF16"
-        if profile:
-            profile_torch.push_record_event(f"Dispatch_{dtype_str}")
-
-        #nvl_chunk_size_tuning_list = range(4, 33, 4)
-        #rdma_chunk_size_tuning_list = range(4, 33, 4)
-        nvl_chunk_size_tuning_list = [20]
-        rdma_chunk_size_tuning_list = [28]
-        for nvl_chunk_size in nvl_chunk_size_tuning_list:
-            for rdma_chunk_size in rdma_chunk_size_tuning_list:
-                config_str = f"sms={num_sms},nvl={nvl_chunk_size},{nvl_buffer_size},rdma={rdma_chunk_size},{rdma_buffer_size}"
-                if profile:
-                    profile_torch.push_record_event(f"Dispatch_{dtype_str}_Config({config_str})")
-
-                config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
-                if handle is not None:
-                    tune_args = {'x': current_x, 'handle': handle, 'config': config}
-                else:
-                    tune_args = {
-                        'x': current_x,
-                        'num_tokens_per_rank': num_tokens_per_rank,
-                        'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
-                        'is_token_in_rank': is_token_in_rank,
-                        'num_tokens_per_expert': num_tokens_per_expert,
-                        'topk_idx': topk_idx,
-                        'topk_weights': topk_weights,
-                        'config': config
-                    }
-                result_times = bench(group, lambda: buffer.dispatch(**tune_args))
-                t = result_times[0]
-                cpu_t = result_times[3]
-
-                if profile:
-                    profile_torch.pop_record_event()
-
-                if local_rank == 0:
-                    print(f'[tuning][rank={rank}] Dispatch ({dtype_str}): SMs {num_sms}, gpu_time: {t:.5f} s, cpu_time: {cpu_t:.5f} s')
-
-        if profile:
-            profile_torch.pop_record_event()
-
-    group.barrier()
-
-    dispatch_config = deep_ep.Config(num_sms, 20, nvl_buffer_size, 28, rdma_buffer_size)
-    dispatch_args = {
-        'x': x,
-        'num_tokens_per_rank': num_tokens_per_rank,
-        'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
-        'is_token_in_rank': is_token_in_rank,
-        'num_tokens_per_expert': num_tokens_per_expert,
-        'topk_idx': topk_idx,
-        'topk_weights': topk_weights,
-        'config': dispatch_config
-    }
-
-    recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
-
-    if profile:
-        profile_torch.push_record_event(f"Combine_BF16")
-
-    # Tune combine performance
-    #nvl_chunk_size_tuning_list = range(1, 5, 1)
-    #rdma_chunk_size_tuning_list = range(8, 33, 4)
-    nvl_chunk_size_tuning_list = [1]
-    rdma_chunk_size_tuning_list = [20]
-    for nvl_chunk_size in nvl_chunk_size_tuning_list:
-        for rdma_chunk_size in rdma_chunk_size_tuning_list:
-            config_str = f"sms={num_sms},nvl={nvl_chunk_size},{nvl_buffer_size},rdma={rdma_chunk_size},{rdma_buffer_size}"
-            if profile:
-                profile_torch.push_record_event(f"Combine_BF16_Config({config_str})")
-
-            config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
-            tune_args = {'x': recv_x, 'handle': handle, 'config': config}
-            result_times = bench(group, lambda: buffer.combine(**tune_args))
-            t = result_times[0]
-            cpu_t = result_times[3]
-
-            if profile:
-                profile_torch.pop_record_event()
-
-            if local_rank == 0:
-                print(f'[tuning][rank={rank}] Combine: SMs {num_sms}, gpu_time: {t:.5f} s, cpu_time: {cpu_t:.5f} s')
 
     if profile:
         profile_torch.pop_record_event()
+
+    time.sleep(1)
+
+    # Config
+    # rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (144, 160) else 512)
+    rdma_buffer_size = 128
+    nvl_buffer_size = 288
+
+    current_x = x
+    handle = None
+
+    nvl_chunk_size = 20
+    rdma_chunk_size = 28
+
+    config_str = f"sms={num_sms},nvl={nvl_chunk_size},{nvl_buffer_size},rdma={rdma_chunk_size},{rdma_buffer_size}"
+    if profile:
+        profile_torch.push_record_event(f"Dispatch_Config({config_str})")
+
+    #dispatch_config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
+    dispatch_config = deep_ep.Buffer.get_dispatch_config(group.size())
+
+    dispatch_num_nvl_bytes = dispatch_config.get_nvl_buffer_size_hint(hidden * 2, group.size())
+    dispatch_num_rdma_bytes = dispatch_config.get_rdma_buffer_size_hint(hidden * 2, group.size())
+
+    if handle is not None:
+        dispatch_args = {'x': current_x, 'handle': handle, 'config': config}
+    else:
+        dispatch_args = {
+            'x': current_x,
+            'num_tokens_per_rank': num_tokens_per_rank,
+            'num_tokens_per_rdma_rank': num_tokens_per_rdma_rank,
+            'is_token_in_rank': is_token_in_rank,
+            'num_tokens_per_expert': num_tokens_per_expert,
+            'topk_idx': topk_idx,
+            'topk_weights': topk_weights,
+            'config': dispatch_config
+        }
+    result_times = bench(group, lambda: buffer.dispatch(**dispatch_args))
+    gpu_time = result_times[0]
+    cpu_time = result_times[3]
+
+    if profile:
+        profile_torch.pop_record_event()
+
+    if local_rank == 0:
+        print(f'[rank={rank}] Dispatch: SMs {num_sms}, nvl_chunk_size {nvl_chunk_size}, nvl_buffer_size {nvl_buffer_size}, rdma_chunk_size {rdma_chunk_size}, rdma_buffer_size {rdma_buffer_size}, num_nvl_bytes {dispatch_num_nvl_bytes}, num_rdma_bytes {dispatch_num_rdma_bytes}; gpu_time: {gpu_time:.5f} s, cpu_time: {cpu_time:.5f} s')
+
+    #group.barrier()
+
+    recv_x, _, _, _, handle, _ = buffer.dispatch(**dispatch_args)
+
+    nvl_chunk_size = 1
+    rdma_chunk_size = 20
+    config_str = f"sms={num_sms},nvl={nvl_chunk_size},{nvl_buffer_size},rdma={rdma_chunk_size},{rdma_buffer_size}"
+    if profile:
+        profile_torch.push_record_event(f"Combine_Config({config_str})")
+
+    #combine_config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
+    combine_config = deep_ep.Buffer.get_combine_config(group.size())
+
+    combine_num_nvl_bytes = combine_config.get_nvl_buffer_size_hint(hidden * 2, group.size())
+    combine_num_rdma_bytes = combine_config.get_rdma_buffer_size_hint(hidden * 2, group.size())
+
+    combine_args = {
+        'x': recv_x,
+        'handle': handle,
+        'config': combine_config
+    }
+    result_times = bench(group, lambda: buffer.combine(**combine_args))
+    gpu_time = result_times[0]
+    cpu_time = result_times[3]
+
+    if profile:
+        profile_torch.pop_record_event()
+
+    if local_rank == 0:
+        print(f'[rank={rank}] Combine: SMs {num_sms}, nvl_chunk_size {nvl_chunk_size}, nvl_buffer_size {nvl_buffer_size}, rdma_chunk_size {rdma_chunk_size}, rdma_buffer_size {rdma_buffer_size}, num_nvl_bytes {combine_num_nvl_bytes}, num_rdma_bytes {combine_num_rdma_bytes}; gpu_time: {gpu_time:.5f} s, cpu_time: {cpu_time:.5f} s')
 
 
 def test_loop(local_rank: int, num_local_ranks: int):
@@ -235,19 +220,21 @@ def test_loop(local_rank: int, num_local_ranks: int):
     if profile:
         profile_torch.switch_profile(0, 0, 1)
 
-    buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=False)
+    #buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=False)
+
     assert num_local_ranks == 8 and num_ranks > 8
     torch.manual_seed(rank)
 
     use_random_input = False
     dump_input = False
     for i in (20, ):
-        test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, use_random_input, dump_input)
-        if local_rank == 0:
-            print()
+        test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, None, group, use_random_input, dump_input)
 
     if profile:
         profile_torch.switch_profile(1, 0, 1)
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
