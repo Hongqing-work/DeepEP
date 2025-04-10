@@ -3,11 +3,8 @@
 #bash kill_process.sh
 
 WORK_ROOT=/root/paddlejob/workspace/env_run/liuyiqun
-export PYTHONPATH=${WORK_ROOT}/env/virtualenvs_cuda12.8/new_paddle_py310_yiqun
+export PYTHONPATH=${WORK_ROOT}/env/virtualenvs_cuda12.8/paddle_py310_yiqun
 export PATH=${PYTHONPATH}/bin:${PATH}
-
-python -c "import paddle; print(paddle.version.commit)"
-#python -c "import torch; print(torch.__version__)"
 
 #export NVSHMEM_DIR=${WORK_ROOT}/Paddle/build_paddle/third_party_cuda12.3_gcc12.2.0_py3.10/install/nvshmem
 #export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH"
@@ -25,22 +22,34 @@ unset DISTRIBUTED_TRAINER_ENDPOINTS
 unset FLAGS_START_PORT
 unset PADDLE_ELASTIC_TIMEOUT
 
-export WORLD_SIZE=8
+START_RANK=54
+END_RANK=62
 
-MASTER_ADDR=10.54.95.204
-MASTER_PORT=58978
-NNODES=${WORLD_SIZE}
-START_NODE=0
-END_NODE=$((${START_NODE} + ${WORLD_SIZE}))
-RANK=$(($PADDLE_TRAINER_ID - ${START_NODE}))
-
-if [ ${PADDLE_TRAINER_ID} -lt ${START_NODE} ]; then
-  echo "$PADDLE_TRAINER_ID exit"
-  exit
-elif [ ${PADDLE_TRAINER_ID} -ge ${END_NODE} ]; then
-  echo "$PADDLE_TRAINER_ID exit"
-  exit
+if [[ ${PADDLE_TRAINER_ID} -lt $START_RANK ]]; then
+    exit 0
 fi
+
+if [[ ${PADDLE_TRAINER_ID} -ge $END_RANK ]]; then
+    exit 0
+fi
+
+export WORLD_SIZE=$(($END_RANK - $START_RANK))
+
+RANK=$(($PADDLE_TRAINER_ID - ${START_RANK}))
+NNODES=${WORLD_SIZE}
+echo "rank: ${RANK}, nnodes: ${NNODES}"
+
+for name in `env | grep -E 'PADDLE|ENDPOINT' | awk -F'=' '{print $1}'`; do
+  unset ${name}
+done
+
+python -c "import paddle; print(paddle.version.commit)"
+
+#MASTER_ADDR="10.95.238.87" # 46
+MASTER_ADDR="10.95.238.158" # 54
+MASTER_PORT=58978
+
+export FLAGS_eager_communication_connection=1
 
 export NCCL_DEBUG=WARN
 #export NVSHMEM_DEBUG=DEBUG
@@ -61,7 +70,7 @@ export NVSHMEM_IB_TRAFFIC_CLASS=162
 #export NVSHMEM_IB_ENABLE_IBGDA=true
 #export NVSHMEM_DISABLE_P2P=0
 export NVSHMEM_BOOTSTRAP=UID
-export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME==xgbe0
+export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=xgbe0
 #export NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY=AF_INET
 #export NVSHMEM_IB_ENABLE_RELAXED_ORDERING=0
 
@@ -76,12 +85,10 @@ export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME==xgbe0
 
 export PATH=/opt/nvidia/nsight-systems/2025.1.1/bin:/usr/local/NVIDIA-Nsight-Compute-2025.1/bin:$PATH
 #nsys_args="nsys profile --stats true -w true -t cuda,nvshmem,nvtx -r um_cpu_page_faults_sum --nic-metrics=true --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_internode_${WORLD_SIZE}nodes_rank${RANK}.paddle"
-#nsys_args="nsys profile --stats true -w true -t cuda,nvtx --nic-metrics=true --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_internode_${WORLD_SIZE}nodes_rank${RANK}.paddle"
-#nsys_args="nsys profile --stats true -w true -t cuda,nvshmem,nvtx --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_simple_${WORLD_SIZE}.paddle"
-#nsys_args="ncu --target-processes all"
+#nsys_args="nsys profile --stats true -w true -t cuda,nvtx --gpu-metrics-devices=all --nic-metrics=true --gpuctxsw=true --capture-range=cudaProfilerApi -x true --force-overwrite true -o test_internode_latency.bf16_${SUFFIX}_rank${rank}"
 
 rm -rf core.*
 rm -rf log
 
-${nsys_args} python -m paddle.distributed.launch --master=${MASTER_ADDR}:${MASTER_PORT} --nnodes=${NNODES} --rank ${RANK} test_internode.py
-#${nsys_args} python -m paddle.distributed.launch --master=${MASTER_ADDR}:${MASTER_PORT} --nnodes=${NNODES} --rank ${RANK} test_simple.py
+#${nsys_args} python -m paddle.distributed.launch --master=${MASTER_ADDR}:${MASTER_PORT} --nnodes=${NNODES} --rank ${RANK} test_internode.py
+${nsys_args} python -m paddle.distributed.launch --master=${MASTER_ADDR}:${MASTER_PORT} --nnodes=${NNODES} --rank ${RANK} test_internode_latency.py
