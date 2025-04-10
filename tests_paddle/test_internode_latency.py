@@ -101,8 +101,6 @@ def test_main(local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: 
     if local_rank == 0:
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
 
-    paddle.distributed.barrier()
-
     if profile:
         profile_paddle.push_record_event("init_input_tensors")
     if use_random_input:
@@ -112,8 +110,12 @@ def test_main(local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: 
     if profile:
         profile_paddle.pop_record_event()
 
+    #paddle.distributed.barrier()
+
     # test bfloat16
     buffer = fused_a2a.get_buffer(group, hidden * 2)
+
+    #paddle.distributed.barrier()
 
     num_warmups = 100
     num_tests = 1000
@@ -122,8 +124,12 @@ def test_main(local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: 
     end_events = [paddle.device.cuda.Event(enable_timing=True) for _ in range(num_tests)]
 
     for i in range(num_warmups + num_tests + 1):
+        #if i == 1:
+        #    paddle.distributed.barrier()
+
         if profile:
             profile_paddle.push_record_event(f"test_{i}")
+
         if not use_random_input:
             inputs_i = input_tensors[i % 20]
             x = inputs_i["x"]
@@ -140,7 +146,6 @@ def test_main(local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: 
             batch_start = time.time()
             start_events[i - num_warmups].record()
 
-        #group.barrier()
         recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, dispatch_event = fused_a2a.fused_dispatch_forward_func(
             x=x,
             token_indices=topk_idx,
@@ -173,8 +178,8 @@ def test_main(local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: 
             profile_paddle.pop_record_event()
         if i >= num_warmups and i < num_warmups + num_tests:
             batch_cpu_time = time.time() - batch_start
-            if local_rank == 0:
-               print(f"-- {i - num_warmups}-th running, cpu_time: {batch_cpu_time:.5f} s")
+            #if local_rank == 0:
+            #   print(f"-- {i - num_warmups}-th running, cpu_time: {batch_cpu_time:.5f} s")
 
     paddle.distributed.barrier(group)
     paddle.device.synchronize()
